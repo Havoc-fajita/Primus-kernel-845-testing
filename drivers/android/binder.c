@@ -4760,29 +4760,25 @@ static int binder_thread_release(struct binder_proc *proc,
 	 * from any epoll data structures holding it with POLLFREE.
 	 * waitqueue_active() is safe to use here because we're holding
 	 * the inner lock.
+	 * If this thread used poll, make sure we remove the waitqueue from any
+	 * poll data structures holding it.
 	 */
-	if ((thread->looper & BINDER_LOOPER_STATE_POLL) &&
-	    waitqueue_active(&thread->wait)) {
-		wake_up_poll(&thread->wait, POLLHUP | POLLFREE);
-	}
+	if (thread->looper & BINDER_LOOPER_STATE_POLL)
+		wake_up_pollfree(&thread->wait);
 
 	binder_inner_proc_unlock(thread->proc);
 
 	/*
-	 * This is needed to avoid races between wake_up_poll() above and
-	 * and ep_remove_waitqueue() called for other reasons (eg the epoll file
-	 * descriptor being closed); ep_remove_waitqueue() holds an RCU read
-	 * lock, so we can be sure it's done after calling synchronize_rcu().
+	 * This is needed to avoid races between wake_up_pollfree() above and
+	 * someone else removing the last entry from the queue for other reasons
+	 * (e.g. ep_remove_wait_queue() being called due to an epoll file
+	 * descriptor being closed).  Such other users hold an RCU read lock, so
+	 * we can be sure they're done after we call synchronize_rcu().
 	 */
 	if (thread->looper & BINDER_LOOPER_STATE_POLL)
 		synchronize_rcu();
 
-	if (send_reply)
-		binder_send_failed_reply(send_reply, BR_DEAD_REPLY);
-	binder_release_work(proc, &thread->todo);
-	binder_thread_dec_tmpref(thread);
-	return active_transactions;
-}
+
 
 static unsigned int binder_poll(struct file *filp,
 				struct poll_table_struct *wait)
@@ -4799,11 +4795,6 @@ static unsigned int binder_poll(struct file *filp,
 	thread->looper |= BINDER_LOOPER_STATE_POLL;
 	wait_for_proc_work = binder_available_for_proc_work_ilocked(thread);
 
-	binder_inner_proc_unlock(thread->proc);
-
-	poll_wait(filp, &thread->wait, wait);
-
-	if (binder_has_work(thread, wait_for_proc_work))
 		return POLLIN;
 
 	return 0;
@@ -4848,15 +4839,7 @@ static int binder_ioctl_write_read(struct file *filp,
 	}
 	if (bwr.read_size > 0) {
 		ret = binder_thread_read(proc, thread, bwr.read_buffer,
-					 bwr.read_size,
-					 &bwr.read_consumed,
-					 filp->f_flags & O_NONBLOCK);
-		trace_binder_read_done(ret);
-		binder_inner_proc_lock(proc);
-		if (!binder_worklist_empty_ilocked(&proc->todo))
-			binder_wakeup_proc_ilocked(proc);
-		binder_inner_proc_unlock(proc);
-		if (ret < 0) {
+
 			if (copy_to_user(ubuf, &bwr, sizeof(bwr)))
 				ret = -EFAULT;
 			goto out;
